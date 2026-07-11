@@ -68,6 +68,7 @@ export async function start(
     registry,
     apiBasePath: config.API_BASE_PATH,
     historyWriter,
+    db: db.db,
   });
   const server = await listen(app, config.PORT);
 
