@@ -1,0 +1,20 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: tms-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: token_management
+    ports:
+      - "5432:5432"
+    volumes:
+      - tms-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d token_management"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+volumes:
+  tms-pgdata:
