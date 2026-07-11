@@ -10,6 +10,8 @@ export interface AppDeps {
   readonly registry: TokenRegistry;
   readonly apiBasePath: string;
   readonly historyWriter: HistoryWriter;
+  /** TTL in seconds (config `TOKEN_TTL_SECONDS`), forwarded to the API router (F04). */
+  readonly ttlSeconds: number;
 }
 
 /**
@@ -19,7 +21,7 @@ export interface AppDeps {
  * performs no I/O and does not bind a port, so tests can drive it directly.
  */
 export function createApp(deps: AppDeps): Express {
-  const { registry, apiBasePath, historyWriter } = deps;
+  const { registry, apiBasePath, historyWriter, ttlSeconds } = deps;
   const app = express();
 
   app.disable("x-powered-by");
@@ -29,7 +31,7 @@ export function createApp(deps: AppDeps): Express {
   app.use(createHealthRouter(registry));
 
   // All business routes (F02+) mount under the configurable base path.
-  app.use(apiBasePath, createApiRouter({ registry, historyWriter }));
+  app.use(apiBasePath, createApiRouter({ registry, historyWriter, ttlSeconds }));
 
   app.use(notFoundHandler);
   app.use(errorHandler);

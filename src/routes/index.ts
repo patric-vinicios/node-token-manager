@@ -2,11 +2,14 @@ import { Router } from "express";
 import type { TokenRegistry } from "../registry/tokenRegistry";
 import type { HistoryWriter } from "../services/historyWriter";
 import { createAssignmentService } from "../services/assignmentService";
+import { createListingService } from "../services/listingService";
 import { createTokensRouter } from "./tokens";
 
 export interface ApiRouterDeps {
   readonly registry: TokenRegistry;
   readonly historyWriter: HistoryWriter;
+  /** TTL in seconds (config `TOKEN_TTL_SECONDS`), threaded to the listing service (F04). */
+  readonly ttlSeconds: number;
 }
 
 /**
@@ -16,11 +19,12 @@ export interface ApiRouterDeps {
  * process-wide singletons directly.
  */
 export function createApiRouter(deps: ApiRouterDeps): Router {
-  const { registry, historyWriter } = deps;
+  const { registry, historyWriter, ttlSeconds } = deps;
   const router = Router();
 
   const assignmentService = createAssignmentService({ registry, historyWriter });
-  router.use("/tokens", createTokensRouter(assignmentService));
+  const listingService = createListingService({ registry, ttlSeconds });
+  router.use("/tokens", createTokensRouter({ assignmentService, listingService }));
 
   return router;
 }
