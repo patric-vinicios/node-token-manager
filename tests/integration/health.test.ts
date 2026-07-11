@@ -3,6 +3,7 @@ import request from "supertest";
 import { describe, expect, it } from "vitest";
 import { createApp } from "../../src/app";
 import { TokenRegistry } from "../../src/registry/tokenRegistry";
+import type { Database } from "../../src/db/client";
 import type { HistoryWriter } from "../../src/services/historyWriter";
 
 /** No-op writer: /health and error-envelope tests never touch history. */
@@ -12,6 +13,9 @@ const noopHistoryWriter: HistoryWriter = {
   stop: async () => undefined,
 };
 
+/** Stub db: these suites never exercise the history read route, so it is unused. */
+const stubDb = {} as unknown as Database;
+
 function appWithPool(size: number) {
   const registry = new TokenRegistry();
   registry.init(Array.from({ length: size }, () => randomUUID()));
@@ -19,6 +23,7 @@ function appWithPool(size: number) {
     registry,
     apiBasePath: "/api",
     historyWriter: noopHistoryWriter,
+    db: stubDb,
   });
   return { app, registry };
 }
