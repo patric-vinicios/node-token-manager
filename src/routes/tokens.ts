@@ -2,12 +2,14 @@ import { Router } from "express";
 import { z } from "zod";
 import { ValidationError } from "../lib/errors";
 import type { AssignmentService } from "../services/assignmentService";
+import type { ListingService } from "../services/listingService";
 import type { HistoryQueryService } from "../services/historyQueryService";
 
 /**
  * Token resource router, mounted at `<API_BASE_PATH>/tokens`. F02 adds
- * `POST /` (assign a token) and F05 adds `GET /:id/history` (usage history);
- * the remaining read/clear endpoints (F04, F06, F07) attach here later.
+ * `POST /` (assign a token), F04 adds `GET /` (list the pool), and F05 adds
+ * `GET /:id/history` (usage history); the remaining read/clear endpoints
+ * (F06, F07) attach here later.
  */
 
 const assignBodySchema = z.object({
@@ -20,12 +22,24 @@ const tokenIdSchema = z.string().uuid("id must be a valid UUID");
 
 export interface TokensRouterDeps {
   readonly assignmentService: AssignmentService;
+  readonly listingService: ListingService;
   readonly historyQueryService: HistoryQueryService;
 }
 
 export function createTokensRouter(deps: TokensRouterDeps): Router {
-  const { assignmentService, historyQueryService } = deps;
+  const { assignmentService, listingService, historyQueryService } = deps;
   const router = Router();
+
+  // GET /api/tokens — full pool snapshot (F04). No parameters in Core Scope, so
+  // every well-formed request succeeds; unexpected read errors go to the central
+  // error handler.
+  router.get("/", (_req, res, next) => {
+    try {
+      res.status(200).json(listingService.list());
+    } catch (err) {
+      next(err);
+    }
+  });
 
   // POST /api/tokens — register utilization: validate userId, assign (or evict
   // + reuse the oldest), and return the hold. Never fails for lack of capacity.

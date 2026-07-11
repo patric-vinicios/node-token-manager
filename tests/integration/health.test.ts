@@ -24,6 +24,7 @@ function appWithPool(size: number) {
     registry,
     apiBasePath: "/api",
     historyWriter: noopHistoryWriter,
+    ttlSeconds: 120,
     db: stubDb,
   });
   return { app, registry };
