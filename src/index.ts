@@ -7,6 +7,7 @@ import { StartupError } from "./lib/errors";
 import { logger } from "./lib/logger";
 import { initializePool } from "./services/poolInitializer";
 import { createHistoryWriter } from "./services/historyWriter";
+import { createTtlSweeper } from "./services/ttlSweeper";
 import { TokenRegistry, tokenRegistry } from "./registry/tokenRegistry";
 
 export interface StartedService {
@@ -68,8 +69,19 @@ export async function start(
     apiBasePath: config.API_BASE_PATH,
     historyWriter,
     ttlSeconds: config.TOKEN_TTL_SECONDS,
+    db: db.db,
   });
   const server = await listen(app, config.PORT);
+
+  // 6. Start the background TTL sweeper (F03) now that the registry and
+  // history writer are ready.
+  const ttlSweeper = createTtlSweeper({
+    registry,
+    historyWriter,
+    ttlSeconds: config.TOKEN_TTL_SECONDS,
+    logger,
+  });
+  ttlSweeper.start();
 
   logger.info(`Token pool initialized: ${registry.available} available`, {
     available: registry.available,
@@ -80,10 +92,12 @@ export async function start(
   });
 
   const shutdown = async (): Promise<void> => {
-    // Stop accepting requests, drain any buffered history writes, then close the DB.
+    // Stop accepting requests, stop the TTL sweeper, drain any buffered
+    // history writes, then close the DB.
     await new Promise<void>((resolve, reject) => {
       server.close((err) => (err ? reject(err) : resolve()));
     });
+    await ttlSweeper.stop();
     await historyWriter.stop();
     await db.close();
   };
