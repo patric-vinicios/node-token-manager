@@ -8,6 +8,7 @@ import type { HistoryWriter } from "../../src/services/historyWriter";
 /** No-op writer: /health and error-envelope tests never touch history. */
 const noopHistoryWriter: HistoryWriter = {
   record: async () => undefined,
+  close: async () => undefined,
   flush: async () => undefined,
   stop: async () => undefined,
 };
