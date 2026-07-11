@@ -29,9 +29,24 @@ export interface HistoryRecordInput {
   readonly evicted: boolean;
 }
 
+export interface HistoryCloseInput {
+  readonly tokenId: string;
+  /** Instant the hold ended; written to the open row's `released_at`. */
+  readonly releasedAt: Date;
+  readonly reason: ReleaseReason;
+}
+
 export interface HistoryWriter {
   /** Persist one assignment event. Never rejects; buffers on failure. */
   record(input: HistoryRecordInput): Promise<void>;
+  /**
+   * Close a token's already-open hold without opening a new one (F03 TTL
+   * release, distinct from F02's close-then-open eviction path). Never
+   * rejects; buffers on failure. Ordered on the same per-token chain as
+   * {@link record}, so a close is never applied after a later open it
+   * should have preceded.
+   */
+  close(input: HistoryCloseInput): Promise<void>;
   /** Best-effort drain of any buffered events (used on graceful shutdown). */
   flush(): Promise<void>;
   /** Stop retrying, drain the buffer, and release timers. */
@@ -54,7 +69,13 @@ export interface HistoryWriterDeps {
   readonly options?: HistoryWriterOptions;
 }
 
-interface BufferedEvent extends HistoryRecordInput {
+/** A pending write, tagged so a single retry buffer can carry either kind. */
+type Operation =
+  | ({ readonly kind: "record" } & HistoryRecordInput)
+  | ({ readonly kind: "close" } & HistoryCloseInput);
+
+interface BufferedEvent {
+  readonly op: Operation;
   attempts: number;
   /** `Date.now()` after which this event is eligible for another attempt. */
   nextAttemptAt: number;
@@ -84,35 +105,50 @@ class DbHistoryWriter implements HistoryWriter {
   }
 
   async record(input: HistoryRecordInput): Promise<void> {
-    // Serialize writes per token: an eviction reuses a token in place, so its
-    // close-then-open must never race ahead of the previous holder's open insert
-    // (which would transiently leave two open rows for one token). Writes for
-    // different tokens still run concurrently.
-    const prev = this.tokenChains.get(input.tokenId);
-    const run = (prev ?? Promise.resolve()).then(() => this.attempt(input));
-    this.tokenChains.set(input.tokenId, run);
+    return this.enqueueOnChain({ kind: "record", ...input });
+  }
+
+  async close(input: HistoryCloseInput): Promise<void> {
+    return this.enqueueOnChain({ kind: "close", ...input });
+  }
+
+  /**
+   * Serialize writes per token: an eviction's close-then-open must never race
+   * ahead of the previous holder's open insert, and a TTL close must never be
+   * applied after a reassignment that logically followed it (which would
+   * transiently leave two open rows, or close the wrong holder's row).
+   * Writes for different tokens still run concurrently.
+   */
+  private enqueueOnChain(op: Operation): Promise<void> {
+    const prev = this.tokenChains.get(op.tokenId);
+    const run = (prev ?? Promise.resolve()).then(() => this.attempt(op));
+    this.tokenChains.set(op.tokenId, run);
     // Bound the map: drop the chain once this write is the tail.
     void run.finally(() => {
-      if (this.tokenChains.get(input.tokenId) === run) {
-        this.tokenChains.delete(input.tokenId);
+      if (this.tokenChains.get(op.tokenId) === run) {
+        this.tokenChains.delete(op.tokenId);
       }
     });
     return run;
   }
 
   /** One write attempt; never rejects (failures go to the retry buffer). */
-  private async attempt(input: HistoryRecordInput): Promise<void> {
+  private async attempt(op: Operation): Promise<void> {
     try {
-      await this.persist(input);
+      await this.persist(op);
     } catch (err) {
-      this.logger.error("History write failed; buffering for retry", {
-        tokenId: input.tokenId,
-        userId: input.userId,
-        evicted: input.evicted,
-        error: err instanceof Error ? err.message : String(err),
-      });
+      this.logger.error(
+        op.kind === "record"
+          ? "History write failed; buffering for retry"
+          : "History close failed; buffering for retry",
+        {
+          tokenId: op.tokenId,
+          ...(op.kind === "record" ? { userId: op.userId, evicted: op.evicted } : { reason: op.reason }),
+          error: err instanceof Error ? err.message : String(err),
+        },
+      );
       this.enqueue({
-        ...input,
+        op,
         attempts: 1,
         nextAttemptAt: Date.now() + this.backoff(1),
       });
@@ -124,11 +160,10 @@ class DbHistoryWriter implements HistoryWriter {
     const pending = this.buffer.splice(0, this.buffer.length);
     for (const event of pending) {
       try {
-        await this.persist(event);
+        await this.persist(event.op);
       } catch (err) {
         this.logger.error("History event lost during flush", {
-          tokenId: event.tokenId,
-          userId: event.userId,
+          tokenId: event.op.tokenId,
           error: err instanceof Error ? err.message : String(err),
         });
       }
@@ -140,27 +175,34 @@ class DbHistoryWriter implements HistoryWriter {
     await this.flush();
   }
 
-  /** The single write, in a transaction only when a prior open row must be closed. */
-  private async persist(input: HistoryRecordInput): Promise<void> {
-    if (input.evicted) {
+  /** The single write; a transaction is used only when a prior open row must also be closed. */
+  private async persist(op: Operation): Promise<void> {
+    if (op.kind === "close") {
+      // Single UPDATE, no transaction: unlike the eviction path there is no
+      // companion insert to keep atomic with the close.
+      await this.db
+        .update(usageHistory)
+        .set({ releasedAt: op.releasedAt, releaseReason: op.reason })
+        .where(and(eq(usageHistory.tokenId, op.tokenId), isNull(usageHistory.releasedAt)));
+      return;
+    }
+    if (op.evicted) {
       await this.db.transaction(async (tx) => {
         await tx
           .update(usageHistory)
-          .set({ releasedAt: input.startedAt, releaseReason: ReleaseReason.EVICTION })
-          .where(
-            and(eq(usageHistory.tokenId, input.tokenId), isNull(usageHistory.releasedAt)),
-          );
+          .set({ releasedAt: op.startedAt, releaseReason: ReleaseReason.EVICTION })
+          .where(and(eq(usageHistory.tokenId, op.tokenId), isNull(usageHistory.releasedAt)));
         await tx.insert(usageHistory).values({
-          tokenId: input.tokenId,
-          userId: input.userId,
-          startedAt: input.startedAt,
+          tokenId: op.tokenId,
+          userId: op.userId,
+          startedAt: op.startedAt,
         });
       });
     } else {
       await this.db.insert(usageHistory).values({
-        tokenId: input.tokenId,
-        userId: input.userId,
-        startedAt: input.startedAt,
+        tokenId: op.tokenId,
+        userId: op.userId,
+        startedAt: op.startedAt,
       });
     }
   }
@@ -169,8 +211,7 @@ class DbHistoryWriter implements HistoryWriter {
     if (this.buffer.length >= this.opts.maxBufferSize) {
       const dropped = this.buffer.shift();
       this.logger.error("History retry buffer full; dropping oldest event", {
-        tokenId: dropped?.tokenId,
-        userId: dropped?.userId,
+        tokenId: dropped?.op.tokenId,
       });
     }
     this.buffer.push(event);
@@ -198,13 +239,12 @@ class DbHistoryWriter implements HistoryWriter {
       const idx = this.buffer.indexOf(event);
       if (idx >= 0) this.buffer.splice(idx, 1);
       try {
-        await this.persist(event);
+        await this.persist(event.op);
       } catch (err) {
         event.attempts += 1;
         if (event.attempts >= this.opts.maxAttempts) {
           this.logger.error("History event permanently failed; dropping after retries", {
-            tokenId: event.tokenId,
-            userId: event.userId,
+            tokenId: event.op.tokenId,
             attempts: event.attempts,
             error: err instanceof Error ? err.message : String(err),
           });
